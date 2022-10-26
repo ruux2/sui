@@ -18,7 +18,7 @@ async fn listen_to_sequenced_transaction() {
 
     // Spawn a consensus listener.
     ConsensusListener::spawn(
-        /* rx_consensus_input */ rx_sui_to_consensus,
+        /* rx_consensus_listener */ rx_sui_to_consensus,
         /* rx_consensus_output */ rx_consensus_to_sui,
     );
 
