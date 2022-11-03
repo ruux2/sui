@@ -7,7 +7,7 @@ use network::{P2pNetwork, UnreliableNetwork};
 use std::{collections::BTreeMap, sync::Arc};
 use tap::TapOptional;
 use tokio::{sync::watch, task::JoinHandle};
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 use types::{
     metered_channel::Receiver, Certificate, ReconfigureNotification, Round,
     WorkerReconfigureMessage,
@@ -75,6 +75,17 @@ impl StateHandler {
         }
 
         // Now we are going to signal which of our own batches have been committed.
+        let own_rounds_committed: Vec<_> = _certificates
+            .iter()
+            .filter_map(|cert| {
+                if cert.header.author == self.name {
+                    Some(cert.header.round)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        debug!("Own committed rounds {:?} at round {:?}", own_rounds_committed, round);
     }
 
     fn update_committee(&mut self, committee: Committee) {
