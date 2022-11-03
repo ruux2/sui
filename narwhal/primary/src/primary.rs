@@ -51,8 +51,9 @@ use types::{
     BatchDigest, Certificate, CertificateDigest, ConsensusStore, FetchCertificatesRequest,
     FetchCertificatesResponse, GetCertificatesRequest, GetCertificatesResponse, Header,
     HeaderDigest, PayloadAvailabilityRequest, PayloadAvailabilityResponse, PrimaryToPrimary,
-    PrimaryToPrimaryServer, ReconfigureNotification, RoundVoteDigestPair, WorkerInfoResponse,
-    WorkerOthersBatchMessage, WorkerOurBatchMessage, WorkerToPrimary, WorkerToPrimaryServer,
+    PrimaryToPrimaryServer, ReconfigureNotification, Round, RoundVoteDigestPair,
+    WorkerInfoResponse, WorkerOthersBatchMessage, WorkerOurBatchMessage, WorkerToPrimary,
+    WorkerToPrimaryServer,
 };
 
 #[cfg(any(test))]
@@ -92,11 +93,11 @@ impl Primary {
         vote_digest_store: Store<PublicKey, RoundVoteDigestPair>,
         consensus_store: Arc<ConsensusStore>,
         tx_new_certificates: Sender<Certificate>,
-        rx_committed_certificates: Receiver<Certificate>,
+        rx_committed_certificates: Receiver<(Round, Vec<Certificate>)>,
         dag: Option<Arc<Dag>>,
         network_model: NetworkModel,
         tx_reconfigure: watch::Sender<ReconfigureNotification>,
-        tx_committed_certificates: Sender<Certificate>,
+        tx_committed_certificates: Sender<(Round, Vec<Certificate>)>,
         registry: &Registry,
         // See comments in Subscriber::spawn
         rx_executor_network: Option<oneshot::Sender<P2pNetwork>>,
