@@ -495,6 +495,12 @@ impl AuthorityMetrics {
 pub type StableSyncAuthoritySigner =
     Pin<Arc<dyn signature::Signer<AuthoritySignature> + Send + Sync>>;
 
+/// ObjectManager is responsible for managing pending certificates and publishes a stream
+/// of certificates ready to be executed. It works together with AuthorityState for receiving
+/// pending certificates, and getting notified about committed objects. Executing driver
+/// subscribes to the stream of ready certificates published by the ObjectManager, and can
+/// execute them in parallel.
+/// TODO: use ObjectManager for fullnode.
 struct ObjectManager {
     authority_store: Arc<AuthorityStore>,
     node_sync_store: Arc<NodeSyncStore>,
@@ -505,7 +511,9 @@ struct ObjectManager {
 }
 
 impl ObjectManager {
-    fn recover(
+    /// If a node restarts, object manager recovers in-memory data from pending certificates and
+    /// other persistent data.
+    fn new(
         authority_store: Arc<AuthorityStore>,
         node_sync_store: Arc<NodeSyncStore>,
         tx_ready_certificates: UnboundedSender<VerifiedCertificate>,
@@ -525,12 +533,14 @@ impl ObjectManager {
         obj_manager
     }
 
+    /// Enqueues a certificate into ObjectManager. Once all of its input objects are available
+    /// locally, it will be published.
     fn enqueue(&mut self, certs: Vec<VerifiedCertificate>) -> SuiResult<()> {
         for cert in certs {
-            let (_, missing, _) = self.authority_store.get_sequenced_input_objects(
-                cert.digest(),
-                &cert.signed_data.data.input_objects()?,
-            )?;
+            let (_, missing, _) = self
+                .authority_store
+                .get_sequenced_input_objects(cert.digest(), &cert.signed_data.data.input_objects()?)
+                .expect("Are shared object locks set prior to enqueueing certificates?");
             if missing.is_empty() {
                 self.certificate_ready(cert);
                 continue;
@@ -554,6 +564,7 @@ impl ObjectManager {
         Ok(())
     }
 
+    /// Notifies ObjectManager that the given objects have been committed.
     fn objects_committed(&mut self, object_keys: Vec<ObjectKey>) {
         for object_key in object_keys {
             let cert_key = if let Some(key) = self.missing_inputs.remove(&object_key) {
@@ -563,6 +574,7 @@ impl ObjectManager {
             };
             let set = self.pending_certificates.entry(cert_key).or_default();
             set.remove(&object_key);
+            // This certificate has no missing input. It is ready to execute.
             if set.is_empty() {
                 self.pending_certificates.remove(&cert_key);
                 // NOTE: failing and ignoring the certificate is fine, if it will be retried at a higher level.
@@ -596,11 +608,15 @@ impl ObjectManager {
             .set(self.pending_certificates.len() as i64);
     }
 
+    /// Marks the given certificate as ready to be executed.
     fn certificate_ready(&self, certificate: VerifiedCertificate) {
         self.metrics.object_manager_num_ready.inc();
         let _ = self.tx_ready_certificates.send(certificate);
     }
 
+    /// Currently we are not yet confident that ObjectManager will be notified about all missing
+    /// objects. So we will run a periodic scanning task that checks if any input object is in
+    /// fact already committed. This will discover ready transactions as well.
     fn scan_ready_transactions(&mut self) {
         let mut available_inputs = Vec::new();
         for (object_key, _) in self.missing_inputs.iter() {
@@ -653,7 +669,10 @@ pub struct AuthorityState {
 
     committee_store: Arc<CommitteeStore>,
 
+    /// Manages pending certificates and their missing input objects.
     object_manager: Arc<tokio::sync::Mutex<ObjectManager>>,
+
+    /// Publishes certificates that are ready to be executed.
     rx_ready_certificates: tokio::sync::Mutex<UnboundedReceiver<VerifiedCertificate>>,
 
     // Structures needed for handling batching and notifications.
@@ -1650,7 +1669,7 @@ impl AuthorityState {
             event_store.map(|es| Arc::new(EventHandler::new(es, module_cache.clone())));
         let metrics = Arc::new(AuthorityMetrics::new(prometheus_registry));
         let (tx_ready_certificates, rx_ready_certificates) = unbounded_channel();
-        let object_manager = Arc::new(tokio::sync::Mutex::new(ObjectManager::recover(
+        let object_manager = Arc::new(tokio::sync::Mutex::new(ObjectManager::new(
             store.clone(),
             node_sync_store.clone(),
             tx_ready_certificates,
@@ -1732,7 +1751,14 @@ impl AuthorityState {
         }
 
         // Start a periodic process to check transactions that are ready.
-        // TODO: rely less on this loop, by sending committed objects to object manager as well.
+        // This is necessary even though we try to notify ObjectManager about each committed
+        // object, because currently there is no transaction semantics for data store.
+        // The following is possible:
+        // 1. A certificate enters ObjectManager, and gathers its missing input objects.
+        // 2. One of its missing input object is committed, and notifies ObjectManager. No action
+        //    will be taken since the input object is not yet part of ObjectManager's data.
+        // 3. ObjectManager saves the certificate's missing input into its data structure,
+        //    including the object just committed.
         let weak_object_manager = Arc::downgrade(&object_manager);
         tokio::task::spawn(async move {
             loop {
@@ -1742,6 +1768,7 @@ impl AuthorityState {
                         if let Some(object_manager) = weak_object_manager.upgrade() {
                             object_manager
                         } else {
+                            // Shut down.
                             return;
                         };
                     let mut object_manager = object_manager_arc_guard.lock().await;
@@ -1825,11 +1852,8 @@ impl AuthorityState {
         .await
     }
 
-    /// Adds certificates to the certificate store and the pending certificates structure for
-    /// later execution.
+    /// Adds certificates to the pending certificate store and object manager for later execution.
     pub async fn add_pending_certificates(&self, certs: Vec<VerifiedCertificate>) -> SuiResult<()> {
-        // TODO: Make sure there will not be issues after crash and recovery,
-        // e.g. if certs are written into batch store, then node crashes before adding to pending.
         self.node_sync_store
             .batch_store_certs(certs.iter().cloned())?;
         let mut object_manager = self.object_manager.lock().await;
@@ -1920,6 +1944,7 @@ impl AuthorityState {
         self.database.get_object(object_id)
     }
 
+    /// Reads the next certificate ready to execute, published by the object manager.
     pub(crate) async fn next_ready_certificate(&self) -> Option<VerifiedCertificate> {
         let mut rx_ready_certificates = self.rx_ready_certificates.lock().await;
         let cert = rx_ready_certificates.recv().await;
@@ -2489,10 +2514,8 @@ impl AuthorityState {
                     "handle_consensus_transaction UserTransaction",
                 );
 
-                // Lock before scheduling pending certificates, otherwise the schedule certificates
-                // may run immediately but unable to find locks.
-                // TODO: verify recovery correctness. Or redesign the flow here / use an atomic
-                // write.
+                // Lock before scheduling pending certificates, otherwise the scheduled
+                // certificates may execute immediately but unable to find locks.
                 if certificate.contains_shared_object() {
                     self.database
                         .lock_shared_objects(&certificate, consensus_index)
@@ -2503,7 +2526,7 @@ impl AuthorityState {
                         .await?;
                 }
 
-                // Schedule the certificate for execution
+                // Schedule the certificate for execution later.
                 self.add_pending_certificates(vec![certificate.clone()])
                     .await
             }

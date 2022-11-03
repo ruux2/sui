@@ -5,13 +5,25 @@ use super::ActiveAuthority;
 use crate::authority::AuthorityState;
 use crate::authority_client::AuthorityAPI;
 use async_trait::async_trait;
-use std::sync::Arc;
-use sui_types::{error::SuiResult, messages::VerifiedCertificate};
-use tokio::time::sleep;
+use std::{sync::Arc, time::Duration};
+use sui_metrics::spawn_monitored_task;
+use sui_types::{
+    error::{SuiError, SuiResult},
+    messages::VerifiedCertificate,
+};
+use tokio::{
+    sync::Semaphore,
+    time::{sleep, timeout},
+};
 use tracing::{debug, error, info, warn};
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+// Maximum number of certificates to be executed concurrently.
+// TODO: make this configurable.
+const MAX_EXECUTION_CONCURRENCY: usize = 20;
+const MAX_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[async_trait]
 pub trait PendCertificateForExecution {
@@ -44,6 +56,9 @@ where
 {
     info!("Starting execution driver process.");
 
+    // Rate limit, similiar to handle_messages() in node_state.rs.
+    let limit = Arc::new(Semaphore::new(MAX_EXECUTION_CONCURRENCY));
+
     // Loop whenever there is a signal that a new transactions is ready to process.
     loop {
         let certificate = if let Some(cert) = active_authority.state.next_ready_certificate().await
@@ -63,13 +78,26 @@ where
             tracing::error!("Error processing tx recovery log: {:?}", err);
         }
 
+        let limit = limit.clone();
+        // hold semaphore permit until task completes. unwrap ok because we never close
+        // the semaphore in this context.
+        let permit = limit.acquire_owned().await.unwrap();
         let authority = active_authority.clone();
-        tokio::task::spawn(async move {
-            if let Err(e) = authority.state.handle_certificate(&certificate).await {
+
+        spawn_monitored_task!(async move {
+            let _ = &permit;
+            let res = timeout(
+                MAX_EXECUTION_TIMEOUT,
+                authority.state.handle_certificate(&certificate),
+            )
+            .await
+            .map_err(|_| SuiError::TimeoutError);
+            if let Err(e) = res {
                 error!(?digest, "Failed to execute certified transaction! {e}");
             }
 
-            // Remove the pending digest after successful execution.
+            // Remove the pending certificate regardless of execution status. It can be retried
+            // from a higher level.
             let _ = authority
                 .state
                 .node_sync_store

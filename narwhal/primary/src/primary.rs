@@ -520,6 +520,7 @@ struct PrimaryReceiverHandler {
     proposer_store: ProposerStore,
 }
 
+#[allow(clippy::result_large_err)]
 impl PrimaryReceiverHandler {
     fn find_next_round(
         &self,
