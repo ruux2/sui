@@ -98,7 +98,7 @@ export class SuiWallet implements Wallet {
             'sui_content-script'
         );
 
-        this.#connected();
+        // this.#connected();
     }
 
     #on: EventsOnMethod = (event, listener) => {

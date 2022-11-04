@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { Ed25519Keypair } from '@mysten/sui.js';
+import { randomBytes } from '@noble/hashes/utils';
 import mitt from 'mitt';
 import { throttle } from 'throttle-debounce';
 import Browser from 'webextension-polyfill';
 
+import { IS_SESSION_STORAGE_SUPPORTED, sessionStorage } from './SessionStorage';
 import { Vault } from './Vault';
 import { createMessage } from '_messages';
 import { isKeyringPayload } from '_payloads/keyring';
@@ -32,12 +34,18 @@ type KeyringEvents = {
 };
 
 const STORAGE_KEY = 'vault';
+const EPHEMERAL_PASSWORD_KEY = '244e4b24e667ebf';
 
 class Keyring {
     #events = mitt<KeyringEvents>();
     #locked = true;
     #keypair: Keypair | null = null;
     #vault: Vault | null = null;
+    #reviveFromSessionComplete: Promise<void>;
+
+    constructor() {
+        this.#reviveFromSessionComplete = this.unlockFromSessionStorage();
+    }
 
     /**
      * Creates a vault and stores it encrypted to the storage of the extension. It doesn't unlock the vault.
@@ -57,25 +65,25 @@ class Keyring {
         await this.storeEncryptedVault(await vault.encrypt(password));
     }
 
-    public lock() {
-        Alarms.clearLockAlarm();
+    public async lock() {
         this.#keypair = null;
         this.#vault = null;
         this.#locked = true;
+        await Alarms.clearLockAlarm();
+        await this.clearVaultFromSessionStorage();
         this.notifyLockedStatusUpdate(this.#locked);
     }
 
     public async unlock(password: string) {
-        Alarms.setLockAlarm();
         this.#vault = await this.decryptVault(password);
-        this.#keypair = Ed25519Keypair.deriveKeypair(this.#vault.getMnemonic());
-        this.#locked = false;
-        this.notifyLockedStatusUpdate(this.#locked);
+        this.unlocked();
+        await this.storeVaultToSessionStorage();
     }
 
     public async clearVault() {
-        await this.storeEncryptedVault(null);
         this.lock();
+        await this.storeEncryptedVault(null);
+        await this.clearVaultFromSessionStorage();
     }
 
     public async isWalletInitialized() {
@@ -158,6 +166,9 @@ class Keyring {
                 await this.unlock(payload.args.password);
                 uiConnection.send(createMessage({ type: 'done' }, id));
             } else if (isKeyringPayload(payload, 'walletStatusUpdate')) {
+                // wait to avoid ui showing locked and then unlocked screen
+                // ui waits until it received this status to render
+                await this.#reviveFromSessionComplete;
                 uiConnection.send(
                     createMessage<KeyringPayload<'walletStatusUpdate'>>(
                         {
@@ -203,23 +214,30 @@ class Keyring {
 
     // pass null to delete it
     private async storeEncryptedVault(
-        encryptedVault: Awaited<ReturnType<Vault['encrypt']>> | null
+        encryptedVault: Awaited<ReturnType<Vault['encrypt']>> | null,
+        storage?: Browser.Storage.LocalStorageArea
     ) {
-        await Browser.storage.local.set({ [STORAGE_KEY]: encryptedVault });
-    }
-
-    private async loadVault() {
-        const storedMnemonic = await Browser.storage.local.get({
-            [STORAGE_KEY]: null,
+        await (storage || Browser.storage.local).set({
+            [STORAGE_KEY]: encryptedVault,
         });
-        return storedMnemonic[STORAGE_KEY];
     }
 
-    private async decryptVault(password: string) {
-        const encryptedVault = await this.loadVault();
+    private async loadVault(storage?: Browser.Storage.LocalStorageArea) {
+        return (
+            await (storage || Browser.storage.local).get({
+                [STORAGE_KEY]: null,
+            })
+        )[STORAGE_KEY];
+    }
+
+    private async decryptVault(
+        password: string,
+        storage?: Browser.Storage.LocalStorageArea
+    ) {
+        const encryptedVault = await this.loadVault(storage);
         if (!encryptedVault) {
             throw new Error(
-                'Mnemonic is not initialized. Create a new one first.'
+                'Wallet is not initialized. Create a new one first.'
             );
         }
         return Vault.from(password, encryptedVault, async (aVault) =>
@@ -254,6 +272,71 @@ class Keyring {
         if (!this.isLocked) {
             await Alarms.setLockAlarm();
         }
+    }
+
+    private async unlockFromSessionStorage() {
+        try {
+            if (IS_SESSION_STORAGE_SUPPORTED) {
+                const password = (
+                    await sessionStorage.get([EPHEMERAL_PASSWORD_KEY])
+                )[EPHEMERAL_PASSWORD_KEY];
+                if (password) {
+                    this.#vault = await this.decryptVault(
+                        password,
+                        sessionStorage
+                    );
+                    this.unlocked();
+                    console.log('unlocked from session storage');
+                }
+            }
+        } catch (e) {
+            // don't bother
+        }
+    }
+
+    private async storeVaultToSessionStorage() {
+        try {
+            if (IS_SESSION_STORAGE_SUPPORTED && this.#vault) {
+                const password = this.getRandomPassword();
+                console.log({ password });
+                await sessionStorage.set({
+                    [EPHEMERAL_PASSWORD_KEY]: password,
+                });
+                await this.storeEncryptedVault(
+                    await this.#vault.encrypt(password),
+                    sessionStorage
+                );
+            }
+        } catch (e) {
+            //TODO: log?
+        }
+    }
+
+    private async clearVaultFromSessionStorage() {
+        try {
+            if (IS_SESSION_STORAGE_SUPPORTED) {
+                await sessionStorage.set({
+                    [EPHEMERAL_PASSWORD_KEY]: null,
+                });
+                await this.storeEncryptedVault(null, sessionStorage);
+            }
+        } catch (e) {
+            //TODO: log?
+        }
+    }
+
+    private getRandomPassword() {
+        return Buffer.from(randomBytes(512)).toString('utf8');
+    }
+
+    private unlocked() {
+        if (!this.#vault) {
+            return;
+        }
+        Alarms.setLockAlarm();
+        this.#keypair = Ed25519Keypair.deriveKeypair(this.#vault.getMnemonic());
+        this.#locked = false;
+        this.notifyLockedStatusUpdate(this.#locked);
     }
 }
 

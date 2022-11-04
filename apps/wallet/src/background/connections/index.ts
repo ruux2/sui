@@ -15,6 +15,28 @@ export class Connections {
     #connections: (Connection | KeepAliveConnection)[] = [];
 
     constructor() {
+        setInterval(() => {
+            console.log(
+                `Total cs connections ${
+                    this.#connections.filter(
+                        (c) => c instanceof ContentScriptConnection
+                    ).length
+                }`
+            );
+            console.log(
+                `Total ui connections ${
+                    this.#connections.filter((c) => c instanceof UiConnection)
+                        .length
+                }`
+            );
+            console.log(
+                `Total keepAlive connections ${
+                    this.#connections.filter(
+                        (c) => c instanceof KeepAliveConnection
+                    ).length
+                }`
+            );
+        }, 1000);
         Browser.runtime.onConnect.addListener((port) => {
             try {
                 let connection: Connection | KeepAliveConnection;
