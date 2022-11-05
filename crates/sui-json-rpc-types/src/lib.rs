@@ -11,6 +11,7 @@ use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
 use colored::Colorize;
+use fastcrypto::encoding::{Base64, Encoding};
 use itertools::Itertools;
 use move_binary_format::file_format::{Ability, AbilitySet, StructTypeParameter, Visibility};
 use move_binary_format::normalized::{
@@ -29,11 +30,10 @@ use serde_json::Value;
 use serde_with::serde_as;
 use tracing::warn;
 
-use fastcrypto::encoding::{Base64, Encoding};
 use sui_json::SuiJsonValue;
 use sui_types::base_types::{
-    ObjectDigest, ObjectID, ObjectInfo, ObjectRef, SequenceNumber, SuiAddress, TransactionDigest,
-    TransactionEffectsDigest,
+    DynamicFieldInfo, ObjectDigest, ObjectID, ObjectInfo, ObjectRef, SequenceNumber, SuiAddress,
+    TransactionDigest, TransactionEffectsDigest,
 };
 use sui_types::committee::EpochId;
 use sui_types::crypto::{AuthorityStrongQuorumSignInfo, SignableBytes, Signature};
@@ -64,6 +64,7 @@ pub type SuiMoveTypeParameterIndex = u16;
 pub type TransactionsPage = Page<TransactionDigest, TransactionDigest>;
 
 pub type EventPage = Page<SuiEventEnvelope, EventID>;
+pub type DynamicFieldPage = Page<DynamicFieldInfo, String>;
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema)]
 pub enum SuiMoveAbility {

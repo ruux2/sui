@@ -1,21 +1,24 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{
-    authority_store_tables::{AuthorityEpochTables, AuthorityPerpetualTables},
-    *,
-};
-use crate::authority::authority_store_tables::ExecutionIndicesWithHash;
-use arc_swap::ArcSwap;
-use once_cell::sync::OnceCell;
-use rocksdb::Options;
-use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
 use std::collections::BTreeMap;
 use std::iter;
 use std::path::Path;
 use std::sync::{atomic::AtomicU64, Arc};
 use std::{fmt::Debug, path::PathBuf};
+
+use arc_swap::ArcSwap;
+use itertools::{Either, Itertools};
+use once_cell::sync::OnceCell;
+use rocksdb::Options;
+use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
+use tokio::sync::Notify;
+use tokio_retry::strategy::{jitter, ExponentialBackoff};
+use tracing::{debug, info, trace};
+use typed_store::rocks::DBBatch;
+use typed_store::traits::Map;
+
 use sui_storage::{
     mutex_table::{LockGuard, MutexTable},
     write_ahead_log::{DBWriteAheadLog, WriteAheadLog},
@@ -26,11 +29,13 @@ use sui_types::crypto::{AuthoritySignInfo, EmptySignInfo};
 use sui_types::object::Owner;
 use sui_types::storage::{ChildObjectResolver, SingleTxContext, WriteKind};
 use sui_types::{base_types::SequenceNumber, storage::ParentSync};
-use tokio::sync::Notify;
-use tokio_retry::strategy::{jitter, ExponentialBackoff};
-use tracing::{debug, info, trace};
-use typed_store::rocks::DBBatch;
-use typed_store::traits::Map;
+
+use crate::authority::authority_store_tables::ExecutionIndicesWithHash;
+
+use super::{
+    authority_store_tables::{AuthorityEpochTables, AuthorityPerpetualTables},
+    *,
+};
 
 pub type AuthorityStore = SuiDataStore<AuthoritySignInfo>;
 pub type GatewayStore = SuiDataStore<EmptySignInfo>;
@@ -276,7 +281,7 @@ impl<S: Eq + Debug + Serialize + for<'de> Deserialize<'de>> SuiDataStore<S> {
     }
 
     // Methods to read the store
-    pub fn get_owner_objects(&self, owner: Owner) -> Result<Vec<ObjectInfo>, SuiError> {
+    pub fn get_owner_objects(&self, owner: SuiAddress) -> Result<Vec<ObjectInfo>, SuiError> {
         debug!(?owner, "get_owner_objects");
         Ok(self
             .perpetual_tables
@@ -285,6 +290,20 @@ impl<S: Eq + Debug + Serialize + for<'de> Deserialize<'de>> SuiDataStore<S> {
             // The object id 0 is the smallest possible
             .skip_to(&(owner, ObjectID::ZERO))?
             .take_while(|((object_owner, _), _)| (object_owner == &owner))
+            .map(|(_, object_info)| object_info)
+            .collect())
+    }
+
+    // Methods to read the store
+    pub fn get_dynamic_fields(&self, object: ObjectID) -> Result<Vec<DynamicFieldInfo>, SuiError> {
+        debug!(?object, "get_dynamic_fields");
+        Ok(self
+            .perpetual_tables
+            .dynamic_field_index
+            .iter()
+            // The object id 0 is the smallest possible
+            .skip_to(&(object, ObjectID::ZERO))?
+            .take_while(|((object_owner, _), _)| (object_owner == &object))
             .map(|(_, object_info)| object_info)
             .collect())
     }
@@ -549,17 +568,36 @@ impl<S: Eq + Debug + Serialize + for<'de> Deserialize<'de>> SuiDataStore<S> {
 
         // Update the index
         if object.get_single_owner().is_some() {
-            self.perpetual_tables.owner_index.insert(
-                &(object.owner, object_ref.0),
-                &ObjectInfo::new(&object_ref, object),
-            )?;
+            match object.owner {
+                Owner::AddressOwner(addr) => self
+                    .perpetual_tables
+                    .owner_index
+                    .insert(&(addr, object_ref.0), &ObjectInfo::new(&object_ref, object))?,
+                Owner::ObjectOwner(object_id) => {
+                    if let Some(info) = DynamicFieldInfo::new(&object_ref, object, &|id| {
+                        if let Ok(Some(o)) = self.get_object(id) {
+                            o.data
+                                .type_()
+                                .cloned()
+                                .map(|type_| (type_, o.version(), o.digest()))
+                        } else {
+                            warn!("Cannot get struct type for dynamic object {object_id}");
+                            None
+                        }
+                    }) {
+                        self.perpetual_tables
+                            .dynamic_field_index
+                            .insert(&(ObjectID::from(object_id), object_ref.0), &info)?
+                    }
+                }
+                _ => {}
+            }
             // Only initialize lock for owned objects.
             // TODO: Skip this for quasi-shared objects.
             self.lock_service
                 .initialize_locks(&[object_ref], false /* is_force_reset */)
                 .await?;
         }
-
         // Update the parent
         self.perpetual_tables
             .parent_sync
@@ -587,9 +625,41 @@ impl<S: Eq + Debug + Serialize + for<'de> Deserialize<'de>> SuiDataStore<S> {
             )?
             .insert_batch(
                 &self.perpetual_tables.owner_index,
-                ref_and_objects
-                    .iter()
-                    .map(|(oref, o)| ((o.owner, oref.0), ObjectInfo::new(oref, o))),
+                ref_and_objects.iter().filter_map(|(oref, o)| {
+                    if let Owner::AddressOwner(addr) = o.owner {
+                        Some(((addr, oref.0), ObjectInfo::new(oref, o)))
+                    } else {
+                        None
+                    }
+                }),
+            )?
+            .insert_batch(
+                &self.perpetual_tables.dynamic_field_index,
+                ref_and_objects.iter().filter_map(|(oref, o)| {
+                    if let Owner::ObjectOwner(object_id) = o.owner {
+                        DynamicFieldInfo::new(oref, o, &|id| {
+                            if let Some((_, o)) =
+                                ref_and_objects.iter().find(|((oid, _, _), _)| oid == id)
+                            {
+                                o.data
+                                    .type_()
+                                    .cloned()
+                                    .map(|type_| (type_, o.version(), o.digest()))
+                            } else if let Ok(Some(o)) = self.get_object(id) {
+                                o.data
+                                    .type_()
+                                    .cloned()
+                                    .map(|type_| (type_, o.version(), o.digest()))
+                            } else {
+                                warn!("Cannot get struct type for dynamic object {object_id}");
+                                None
+                            }
+                        })
+                        .map(|info| ((ObjectID::from(object_id), oref.0), info))
+                    } else {
+                        None
+                    }
+                }),
             )?
             .insert_batch(
                 &self.perpetual_tables.parent_sync,
@@ -838,7 +908,7 @@ impl<S: Eq + Debug + Serialize + for<'de> Deserialize<'de>> SuiDataStore<S> {
         // For wrapped objects, although their owners technically didn't change, we will lose track
         // of them and there is no guarantee on their owner in the future. Hence we treat them
         // the same as deleted.
-        let old_object_owners =
+        let (old_object_owners, old_dynamic_fields): (Vec<_>, Vec<_>) =
             deleted
                 .iter()
                 // We need to call get() on objects because some object that were just deleted may not
@@ -852,11 +922,24 @@ impl<S: Eq + Debug + Serialize + for<'de> Deserialize<'de>> SuiDataStore<S> {
                         }
                         _ => None,
                     },
-                ));
+                ))
+                .partition_map(|(owner, id)| match owner {
+                    Owner::AddressOwner(address) => Either::Left((address, id)),
+                    Owner::ObjectOwner(object_id) => {
+                        Either::Right(Some((ObjectID::from(object_id), id)))
+                    }
+                    _ => Either::Right(None),
+                });
+
+        let old_dynamic_fields = old_dynamic_fields.into_iter().flatten();
 
         // Delete the old owner index entries
         write_batch =
             write_batch.delete_batch(&self.perpetual_tables.owner_index, old_object_owners)?;
+        write_batch = write_batch.delete_batch(
+            &self.perpetual_tables.dynamic_field_index,
+            old_dynamic_fields,
+        )?;
 
         // Index the certificate by the objects mutated
         write_batch = write_batch.insert_batch(
@@ -893,18 +976,42 @@ impl<S: Eq + Debug + Serialize + for<'de> Deserialize<'de>> SuiDataStore<S> {
             .remove(&transaction_digest)?;
 
         // Update the indexes of the objects written
-        write_batch = write_batch.insert_batch(
-            &self.perpetual_tables.owner_index,
-            written
-                .iter()
-                .filter_map(|(_id, (object_ref, new_object, _kind))| {
-                    trace!(?object_ref, owner =? new_object.owner, "Updating owner_index");
-                    new_object
-                        .get_owner_and_id()
-                        .map(|owner_id| (owner_id, ObjectInfo::new(object_ref, new_object)))
-                }),
-        )?;
+        let (owner_written, dynamic_field_written): (Vec<_>, Vec<_>) = written
+            .iter()
+            .partition_map(|(id, (object_ref, new_object, _))| match new_object.owner {
+                Owner::AddressOwner(address) => {
+                    Either::Left(((address, *id), ObjectInfo::new(object_ref, new_object)))
+                }
+                Owner::ObjectOwner(object_id) => Either::Right(
+                    DynamicFieldInfo::new(object_ref, new_object, &|id| {
+                        if let Some((_, o, _)) = written.get(id) {
+                            o.data
+                                .type_()
+                                .cloned()
+                                .map(|type_| (type_, o.version(), o.digest()))
+                        } else if let Ok(Some(o)) = self.get_object(id) {
+                            o.data
+                                .type_()
+                                .cloned()
+                                .map(|type_| (type_, o.version(), o.digest()))
+                        } else {
+                            warn!("Cannot get struct type for dynamic object {object_id}");
+                            None
+                        }
+                    })
+                    .map(|info| ((ObjectID::from(object_id), *id), info)),
+                ),
+                _ => Either::Right(None),
+            });
 
+        let dynamic_field_written = dynamic_field_written.into_iter().flatten();
+
+        write_batch =
+            write_batch.insert_batch(&self.perpetual_tables.owner_index, owner_written)?;
+        write_batch = write_batch.insert_batch(
+            &self.perpetual_tables.dynamic_field_index,
+            dynamic_field_written,
+        )?;
         // Insert each output object into the stores
         write_batch = write_batch.insert_batch(
             &self.perpetual_tables.objects,
@@ -1017,14 +1124,28 @@ impl<S: Eq + Debug + Serialize + for<'de> Deserialize<'de>> SuiDataStore<S> {
         // the older version, and then rewrite the entry with the old object info.
         // TODO: Validators should not need to maintain owner_index.
         // This is dependent on https://github.com/MystenLabs/sui/issues/2629.
-        let owners_to_delete = effects
+        let (owners_to_delete, dynamic_field_to_delete): (Vec<_>, Vec<_>) = effects
             .created
             .iter()
             .chain(effects.unwrapped.iter())
             .chain(effects.mutated.iter())
-            .map(|((id, _, _), owner)| (*owner, *id));
+            .map(|((id, _, _), owner)| (*owner, *id))
+            .partition_map(|(owner, id)| match owner {
+                Owner::AddressOwner(addr) => Either::Left((addr, id)),
+                Owner::ObjectOwner(object_id) => {
+                    Either::Right(Some((ObjectID::from(object_id), id)))
+                }
+                _ => Either::Right(None),
+            });
+
+        let dynamic_field_to_delete = dynamic_field_to_delete.into_iter().flatten();
+
         write_batch =
             write_batch.delete_batch(&self.perpetual_tables.owner_index, owners_to_delete)?;
+        write_batch = write_batch.delete_batch(
+            &self.perpetual_tables.dynamic_field_index,
+            dynamic_field_to_delete,
+        )?;
         let mutated_objects = effects
             .mutated
             .iter()
@@ -1039,19 +1160,41 @@ impl<S: Eq + Debug + Serialize + for<'de> Deserialize<'de>> SuiDataStore<S> {
                         .expect("version revert should never fail"),
                 )
             });
-        let old_objects = self
+        let (old_objects, old_dynamic_fields): (Vec<_>, Vec<_>) = self
             .perpetual_tables
             .objects
             .multi_get(mutated_objects)?
             .into_iter()
-            .map(|obj_opt| {
+            .partition_map(|obj_opt| {
                 let obj = obj_opt.expect("Older object version not found");
-                (
-                    (obj.owner, obj.id()),
-                    ObjectInfo::new(&obj.compute_object_reference(), &obj),
-                )
+                match obj.owner {
+                    Owner::AddressOwner(addr) => Either::Left((
+                        (addr, obj.id()),
+                        ObjectInfo::new(&obj.compute_object_reference(), &obj),
+                    )),
+                    Owner::ObjectOwner(object_id) => Either::Right(
+                        DynamicFieldInfo::new(&obj.compute_object_reference(), &obj, &|id| {
+                            if let Ok(Some(o)) = self.get_object(id) {
+                                o.data
+                                    .type_()
+                                    .cloned()
+                                    .map(|type_| (type_, o.version(), o.digest()))
+                            } else {
+                                warn!("Cannot get struct type for dynamic object {object_id}");
+                                None
+                            }
+                        })
+                        .map(|info| ((ObjectID::from(object_id), obj.id()), info)),
+                    ),
+                    _ => Either::Right(None),
+                }
             });
+        let old_dynamic_fields = old_dynamic_fields.into_iter().flatten();
         write_batch = write_batch.insert_batch(&self.perpetual_tables.owner_index, old_objects)?;
+        write_batch = write_batch.insert_batch(
+            &self.perpetual_tables.dynamic_field_index,
+            old_dynamic_fields,
+        )?;
 
         write_batch.write()?;
         Ok(())

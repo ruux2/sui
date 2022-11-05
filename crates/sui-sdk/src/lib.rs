@@ -32,8 +32,8 @@ use sui_json_rpc::api::RpcReadApiClient;
 use sui_json_rpc::api::TransactionExecutionApiClient;
 pub use sui_json_rpc_types as rpc_types;
 use sui_json_rpc_types::{
-    EventPage, GetObjectDataResponse, GetRawObjectDataResponse, SuiEventEnvelope, SuiEventFilter,
-    SuiObjectInfo, SuiTransactionResponse, TransactionsPage,
+    DynamicFieldPage, EventPage, GetObjectDataResponse, GetRawObjectDataResponse, SuiEventEnvelope,
+    SuiEventFilter, SuiObjectInfo, SuiTransactionResponse, TransactionsPage,
 };
 use sui_transaction_builder::{DataReader, TransactionBuilder};
 pub use sui_types as types;
@@ -203,11 +203,11 @@ impl ReadApi {
         Ok(self.api.http.get_objects_owned_by_address(address).await?)
     }
 
-    pub async fn get_objects_owned_by_object(
+    pub async fn get_dynamic_fields(
         &self,
         object_id: ObjectID,
-    ) -> anyhow::Result<Vec<SuiObjectInfo>> {
-        Ok(self.api.http.get_objects_owned_by_object(object_id).await?)
+    ) -> anyhow::Result<DynamicFieldPage> {
+        Ok(self.api.http.get_dynamic_fields(object_id).await?)
     }
 
     pub async fn get_parsed_object(

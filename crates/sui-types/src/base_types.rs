@@ -11,10 +11,13 @@ use std::str::FromStr;
 use anyhow::anyhow;
 use curve25519_dalek::ristretto::RistrettoPoint;
 use digest::Digest;
+use fastcrypto::encoding::{Base64, Encoding, Hex};
 use hex::FromHex;
+use itertools::Itertools;
 use move_core_types::account_address::AccountAddress;
 use move_core_types::ident_str;
 use move_core_types::identifier::IdentStr;
+use move_core_types::language_storage::{StructTag, TypeTag};
 use opentelemetry::{global, Context};
 use rand::Rng;
 use schemars::JsonSchema;
@@ -34,7 +37,7 @@ use crate::error::SuiError;
 use crate::object::{Object, Owner};
 use crate::sui_serde::Readable;
 use crate::waypoint::IntoPoint;
-use fastcrypto::encoding::{Base64, Encoding, Hex};
+use crate::SUI_FRAMEWORK_ADDRESS;
 
 #[cfg(test)]
 #[path = "unit_tests/base_types_tests.rs"]
@@ -126,6 +129,89 @@ impl From<&ObjectInfo> for ObjectRef {
     fn from(info: &ObjectInfo) -> Self {
         (info.object_id, info.version, info.digest)
     }
+}
+
+#[derive(Clone, Serialize, Deserialize, JsonSchema, Ord, PartialOrd, Eq, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicFieldInfo {
+    pub name: String,
+    pub type_: DynamicFieldType,
+    pub object_type: String,
+    pub object_id: ObjectID,
+    pub version: SequenceNumber,
+    pub digest: ObjectDigest,
+}
+
+impl DynamicFieldInfo {
+    pub fn new(
+        oref: &ObjectRef,
+        o: &Object,
+        get_object_info: &dyn Fn(&ObjectID) -> Option<(StructTag, SequenceNumber, ObjectDigest)>,
+    ) -> Option<Self> {
+        let field = o.data.try_as_move()?;
+        if !is_dynamic_field(&field.type_) {
+            return None;
+        }
+        // Assuming dynamic field's bytearray structured as following [field object id][field name][1][object id]
+        // field object id and object id is the same for dynamic field, and different for dynamic object.
+
+        // index of the 1u8 byte
+        let (index, _) = field
+            .contents()
+            .iter()
+            .find_position(|byte| **byte == 1u8)?;
+        let name = &field.contents()[ObjectID::LENGTH..index];
+
+        let name = if name.len() == ObjectID::LENGTH {
+            ObjectID::try_from(name).ok()?.to_hex_literal()
+        } else if let Ok(name) = String::from_utf8(name.to_vec()) {
+            name
+        } else {
+            Base64::encode(name)
+        };
+
+        let object_id =
+            ObjectID::try_from(&field.contents()[index + 1..ObjectID::LENGTH + index + 1]).ok()?;
+
+        Some(if is_dynamic_object_field(&field.type_.type_params[0]) {
+            let (object_type, version, digest) = get_object_info(&object_id)?;
+            Self {
+                name,
+                type_: DynamicFieldType::Object,
+                object_type: object_type.to_string(),
+                object_id,
+                version,
+                digest,
+            }
+        } else {
+            Self {
+                name,
+                type_: DynamicFieldType::Field(object_id),
+                object_type: field.type_.type_params[1].to_string(),
+                object_id: oref.0,
+                version: oref.1,
+                digest: oref.2,
+            }
+        })
+    }
+}
+
+fn is_dynamic_field(tag: &StructTag) -> bool {
+    tag.address == SUI_FRAMEWORK_ADDRESS
+        && tag.module.as_str() == "dynamic_field"
+        && tag.name.as_str() == "Field"
+}
+
+fn is_dynamic_object_field(tag: &TypeTag) -> bool {
+    matches!(tag, TypeTag::Struct(tag) if tag.address == SUI_FRAMEWORK_ADDRESS
+        && tag.module.as_str() == "dynamic_object_field"
+        && tag.name.as_str() == "Wrapper")
+}
+
+#[derive(Clone, Serialize, Deserialize, JsonSchema, Ord, PartialOrd, Eq, PartialEq, Debug)]
+pub enum DynamicFieldType {
+    Field(ObjectID),
+    Object,
 }
 
 pub const SUI_ADDRESS_LENGTH: usize = ObjectID::LENGTH;

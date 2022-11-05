@@ -475,22 +475,8 @@ async fn test_public_transfer_object_with_retry() {
         .unwrap()
         .is_none());
     assert_eq!(gateway.store().next_sequence_number().unwrap(), 1);
-    assert_eq!(
-        gateway
-            .store()
-            .get_owner_objects(Owner::AddressOwner(addr1))
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(
-        gateway
-            .store()
-            .get_owner_objects(Owner::AddressOwner(addr2))
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_eq!(gateway.store().get_owner_objects(addr1).unwrap().len(), 1);
+    assert_eq!(gateway.store().get_owner_objects(addr2).unwrap().len(), 1);
     assert_eq!(
         gateway
             .store()

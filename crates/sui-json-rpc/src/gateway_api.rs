@@ -14,8 +14,8 @@ use signature::Signature;
 use sui_core::gateway_state::GatewayClient;
 use sui_json::SuiJsonValue;
 use sui_json_rpc_types::{
-    GetObjectDataResponse, RPCTransactionRequestParams, SuiObjectInfo, SuiTransactionResponse,
-    SuiTypeTag, TransactionBytes,
+    DynamicFieldPage, GetObjectDataResponse, RPCTransactionRequestParams, SuiObjectInfo,
+    SuiTransactionResponse, SuiTypeTag, TransactionBytes,
 };
 use sui_open_rpc::Module;
 use sui_types::batch::TxSequenceNumber;
@@ -135,12 +135,12 @@ impl RpcReadApiServer for GatewayReadApiImpl {
         Ok(self.client.get_objects_owned_by_address(address).await?)
     }
 
-    async fn get_objects_owned_by_object(
-        &self,
-        object_id: ObjectID,
-    ) -> RpcResult<Vec<SuiObjectInfo>> {
+    async fn get_dynamic_fields(&self, object_id: ObjectID) -> RpcResult<DynamicFieldPage> {
         debug!("get_objects_own_by_object : {}", object_id);
-        Ok(self.client.get_objects_owned_by_object(object_id).await?)
+        Ok(DynamicFieldPage {
+            data: vec![],
+            next_cursor: None,
+        })
     }
 
     async fn get_object(&self, object_id: ObjectID) -> RpcResult<GetObjectDataResponse> {

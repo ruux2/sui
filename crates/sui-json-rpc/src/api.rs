@@ -10,9 +10,9 @@ use jsonrpsee_proc_macros::rpc;
 use fastcrypto::encoding::Base64;
 use sui_json::SuiJsonValue;
 use sui_json_rpc_types::{
-    EventPage, GetObjectDataResponse, GetPastObjectDataResponse, GetRawObjectDataResponse,
-    MoveFunctionArgType, RPCTransactionRequestParams, SuiEventEnvelope, SuiEventFilter,
-    SuiExecuteTransactionResponse, SuiGasCostSummary, SuiMoveNormalizedFunction,
+    DynamicFieldPage, EventPage, GetObjectDataResponse, GetPastObjectDataResponse,
+    GetRawObjectDataResponse, MoveFunctionArgType, RPCTransactionRequestParams, SuiEventEnvelope,
+    SuiEventFilter, SuiExecuteTransactionResponse, SuiGasCostSummary, SuiMoveNormalizedFunction,
     SuiMoveNormalizedModule, SuiMoveNormalizedStruct, SuiObjectInfo, SuiTransactionEffects,
     SuiTransactionFilter, SuiTransactionResponse, SuiTypeTag, TransactionBytes, TransactionsPage,
 };
@@ -74,12 +74,12 @@ pub trait RpcReadApi {
     ) -> RpcResult<Vec<SuiObjectInfo>>;
 
     /// Return the list of objects owned by an object.
-    #[method(name = "getObjectsOwnedByObject")]
-    async fn get_objects_owned_by_object(
+    #[method(name = "getDynamicFields")]
+    async fn get_dynamic_fields(
         &self,
         /// the ID of the owner object
         object_id: ObjectID,
-    ) -> RpcResult<Vec<SuiObjectInfo>>;
+    ) -> RpcResult<DynamicFieldPage>;
 
     /// Return the total number of transactions known to the server.
     #[method(name = "getTotalTransactionNumber")]

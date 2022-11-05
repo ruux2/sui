@@ -638,18 +638,11 @@ impl SuiClientCommands {
 
             SuiClientCommands::Objects { address } => {
                 let address = address.unwrap_or(context.active_address()?);
-                let mut address_object = context
+                let address_object = context
                     .client
                     .read_api()
                     .get_objects_owned_by_address(address)
                     .await?;
-                let object_objects = context
-                    .client
-                    .read_api()
-                    .get_objects_owned_by_object(address.into())
-                    .await?;
-                address_object.extend(object_objects);
-
                 SuiClientCommandResult::Objects(address_object)
             }
 

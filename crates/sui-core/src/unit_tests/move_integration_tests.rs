@@ -21,7 +21,7 @@ use sui_types::{
     error::SuiError,
     event::{Event, EventType},
     messages::ExecutionStatus,
-    object::OBJECT_START_VERSION,
+    object::{Owner, OBJECT_START_VERSION},
 };
 
 use std::path::PathBuf;

@@ -1962,13 +1962,13 @@ async fn test_store_revert_state_update() {
     );
     assert!(authority_state
         .database
-        .get_owner_objects(Owner::AddressOwner(recipient))
+        .get_owner_objects(recipient)
         .unwrap()
         .is_empty());
     assert_eq!(
         authority_state
             .database
-            .get_owner_objects(Owner::AddressOwner(sender))
+            .get_owner_objects(sender)
             .unwrap()
             .len(),
         1,
