@@ -154,7 +154,6 @@ impl DynamicFieldInfo {
         }
         // Assuming dynamic field's bytearray structured as following [field object id][field name][1][object id]
         // field object id and object id is the same for dynamic field, and different for dynamic object.
-
         // index of the 1u8 byte
         let (index, _) = field
             .contents()

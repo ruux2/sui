@@ -11,9 +11,6 @@ use jsonrpsee::core::RpcResult;
 use jsonrpsee_core::server::rpc_module::RpcModule;
 use move_binary_format::normalized::{Module as NormalizedModule, Type};
 use move_core_types::identifier::Identifier;
-use signature::Signature;
-use std::collections::BTreeMap;
-use std::sync::Arc;
 use tap::TapFallible;
 use tracing::debug;
 
